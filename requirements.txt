@@ -10,3 +10,5 @@ pandas
 pathlib
 hsluv
 matplotlib
+dill
+surmise
