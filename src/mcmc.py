@@ -1,29 +1,3 @@
-"""
-Markov chain Monte Carlo model calibration using the `affine-invariant ensemble
-sampler (emcee) <http://dfm.io/emcee>`_.
-
-This module must be run explicitly to create the posterior distribution.
-Run ``python -m src.mcmc --help`` for complete usage information.
-
-On first run, the number of walkers and burn-in steps must be specified, e.g.
-::
-
-    python -m src.mcmc --nwalkers 500 --nburnsteps 100 200
-
-would run 500 walkers for 100 burn-in steps followed by 200 production steps.
-This will create the HDF5 file :file:`cache/mcmc_chain.hdf` (default path).
-
-On subsequent runs, the chain resumes from the last point and the number of
-walkers is inferred from the chain, so only the number of production steps is
-required, e.g. ::
-
-    python -m src.mcmc 300
-
-would run an additional 300 production steps (total of 500).
-
-To restart the chain, delete (or rename) the chain HDF5 file.
-"""
-
 import argparse
 from contextlib import contextmanager
 import logging
@@ -49,31 +23,7 @@ def cov(
             frozenset({'dNch_deta', 'dET_deta', 'dN_dy'}),
         }
 ):
-    """
-    Estimate a covariance matrix for the given system and pair of observables,
-    e.g.:
 
-    >>> cov('PbPb2760', 'dN_dy', 'pion', 'dN_dy', 'pion')
-    >>> cov('PbPb5020', 'dN_dy', 'pion', 'dNch_deta', None)
-
-    For each dataset, stat and sys errors are used if available.  If only
-    "summed" error is available, it is treated as sys error, and `stat_frac`
-    sets the fractional stat error.
-
-    Systematic errors are assumed to have a Gaussian correlation as a function
-    of centrality percentage, with correlation length set by `sys_corr_length`.
-
-    If obs{1,2} are the same but subobs{1,2} are different, the sys error
-    correlation is reduced by `cross_factor`.
-
-    If obs{1,2} are different and uncorrelated, the covariance is zero.  If
-    they are correlated, the sys error correlation is reduced by
-    `cross_factor`.  Two different obs are considered correlated if they are
-    both a member of one of the groups in `corr_obs` (the groups must be
-    set-like objects).  By default {Nch, ET, dN/dy} are considered correlated
-    since they are all related to particle / energy production.
-
-    """
     def unpack(obs, subobs):
         dset = exp_data_list[system][obs][subobs]
         yerr = dset['yerr']
@@ -115,22 +65,7 @@ def cov(
     return C
 
 def mvn_loglike(y, cov):
-    """
-    Evaluate the multivariate-normal log-likelihood for difference vector `y`
-    and covariance matrix `cov`:
 
-        log_p = -1/2*[(y^T).(C^-1).y + log(det(C))] + const.
-
-    The likelihood is NOT NORMALIZED, since this does not affect MCMC.  The
-    normalization const = -n/2*log(2*pi), where n is the dimensionality.
-
-    Arguments `y` and `cov` MUST be np.arrays with dtype == float64 and shapes
-    (n) and (n, n), respectively.  These requirements are NOT CHECKED.
-
-    The calculation follows algorithm 2.1 in Rasmussen and Williams (Gaussian
-    Processes for Machine Learning).
-
-    """
     # Compute the Cholesky decomposition of the covariance.
     # Use bare LAPACK function to avoid scipy.linalg wrapper overhead.
     L, info = lapack.dpotrf(cov, clean=False)
@@ -197,34 +132,13 @@ class Chain:
     def __init__(self, path=workdir / 'cache' / 'mcmc_chain.hdf', picklefile=None):
         self.path = path
         self.path.parent.mkdir(exist_ok=True)
-
-        # parameter order:
-        #  - normalizations (one for each system)
-        #  - all other physical parameters (same for all systems)
-        #  - model sys error
-        """
-        def keys_labels_range():
-            for sys in systems:
-                d = Design(sys)
-                klr = zip(d.keys, d.labels, d.range)
-                k, l, r = next(klr)
-                #assert k == 'lambda_jet'
-                yield (
-                    '{} {}'.format(k, sys),
-                    '{}\n{:.2f} TeV'.format(l, d.beam_energy/1000),
-                    r
-                )
-
-            yield from klr
-        """
-        
+ 
         tunedata = TuneData(picklefile)
         self.keys = tunedata.keys
         self.labels = tunedata.labels
         self.range = tunedata.ranges
         self.systems = tunedata.systems
 
-        # print(self.range)
         self.ndim = len(self.range)
         self.min, self.max = map(np.array, zip(*self.range))
 
@@ -275,37 +189,14 @@ class Chain:
                         if tunedata.exp_cov[sys][(obs1, subobs1)][(obs2, subobs2)] is not None:
                             self._expt_cov[sys][slc1, slc2] = tunedata.exp_cov[sys][(obs1, subobs1)][(obs2, subobs2)]
 
-            # print(self._expt_y[sys])
-            # print(self._expt_cov[sys])
     def _predict(self, X, **kwargs):
-        """
-        Call each system emulator to predict model output at X.
-
-        """
-        return {
-            sys: emulators[sys].predict(
-                X[:, ],#[n] + self._common_indices],
-                **kwargs
-            )
-            for n, sys in enumerate(self.systems)
-        }
+        return {sys: emulators[sys].predict(X, **kwargs) for sys in self.systems}
 
     def log_posterior(self, X, extra_std_prior_scale=0.05, model_sys_error = False):
-        """
-        Evaluate the posterior at `X`.
-
-        `extra_std_prior_scale` is the scale parameter for the prior
-        distribution on the model sys error parameter:
-
-            prior ~ sigma^2 * exp(-sigma/scale)
-
-        This model sys error parameter is not by default implemented.
-
-        """
-        X = np.array(X, copy=False, ndmin=2)
+        X = np.asarray(X)
 
         lp = np.zeros(X.shape[0])
-
+        # log prior
         inside = np.all((X > self.min) & (X < self.max), axis=1)
         lp[~inside] = -np.inf
 
@@ -317,9 +208,7 @@ class Chain:
             else:
                 extra_std = 0.0
 
-            pred = self._predict(
-                X[inside], return_cov=True, extra_std=extra_std
-            )
+            pred = self._predict(X[inside], return_cov=True)
 
             for sys in self.systems:
                 nobs = self._expt_y[sys].size
